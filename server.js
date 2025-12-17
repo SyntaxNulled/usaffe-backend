@@ -115,6 +115,22 @@ app.get('/api/avatar/:robloxId', async (req, res) => {
 });
 
 // ===============================
+// HELPER: RESOLVE INTERNAL USER ID
+// Accepts either internal ID or roblox_id
+// ===============================
+function resolveInternalUserId(idOrRoblox, callback) {
+  db.get(
+    `SELECT id FROM users WHERE id = ? OR roblox_id = ?`,
+    [idOrRoblox, idOrRoblox.toString()],
+    (err, row) => {
+      if (err) return callback(err);
+      if (!row) return callback(new Error('User not found'));
+      callback(null, row.id);
+    }
+  );
+}
+
+// ===============================
 // USER PROFILE
 // ===============================
 app.get('/api/users/:robloxId', (req, res) => {
@@ -196,69 +212,132 @@ app.post('/api/trainings/create', (req, res) => {
   );
 });
 
-// Add attendees
+// Add attendees (expects INTERNAL IDs or Roblox IDs; will resolve)
 app.post('/api/trainings/:trainingId/attendees', (req, res) => {
   const { trainingId } = req.params;
   const { attendees } = req.body;
+
+  if (!Array.isArray(attendees) || attendees.length === 0) {
+    return res.status(400).json({ error: 'Attendees array required' });
+  }
 
   const stmt = db.prepare(
     `INSERT INTO training_attendance (training_id, user_id) VALUES (?, ?)`
   );
 
-  attendees.forEach(userId => {
-    if (userId) stmt.run(trainingId, userId);
-  });
+  let pending = attendees.length;
+  let hadError = false;
 
-  stmt.finalize(err => {
-    if (err) return res.status(500).json({ error: 'Failed to add attendees' });
-    res.json({ success: true });
+  attendees.forEach(rawId => {
+    if (!rawId) {
+      pending--;
+      if (pending === 0 && !hadError) {
+        stmt.finalize();
+        res.json({ success: true });
+      }
+      return;
+    }
+
+    resolveInternalUserId(rawId, (err, internalId) => {
+      if (err) {
+        console.warn('Failed to resolve user for training attendee:', rawId);
+      } else {
+        stmt.run(trainingId, internalId);
+      }
+
+      pending--;
+      if (pending === 0 && !hadError) {
+        stmt.finalize(e => {
+          if (e) return res.status(500).json({ error: 'Failed to add attendees' });
+          res.json({ success: true });
+        });
+      }
+    });
   });
 });
 
 // Award medal
+// Accepts:
+//  - user_id / awarded_by as INTERNAL IDs
+//  OR
+//  - user_roblox_id / awarded_by_roblox_id as Roblox IDs
 app.post('/api/medals/award', (req, res) => {
-  const { medal_id, user_id, awarded_by, reason } = req.body;
+  const { medal_id, user_id, awarded_by, user_roblox_id, awarded_by_roblox_id, reason } = req.body;
   const date = new Date().toISOString();
 
-  db.run(
-    `INSERT INTO medal_awards (medal_id, user_id, awarded_by, date, reason)
-     VALUES (?, ?, ?, ?, ?)`,
-    [medal_id, user_id, awarded_by, date, reason],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Failed to award medal' });
-      res.json({ success: true });
-    }
-  );
+  if (!medal_id || !reason) {
+    return res.status(400).json({ error: 'medal_id and reason are required' });
+  }
+
+  const userIdSource = user_id || user_roblox_id;
+  const awardedBySource = awarded_by || awarded_by_roblox_id;
+
+  if (!userIdSource || !awardedBySource) {
+    return res.status(400).json({ error: 'User and awarded_by identifiers are required' });
+  }
+
+  resolveInternalUserId(userIdSource, (err, internalUserId) => {
+    if (err) return res.status(400).json({ error: 'Target user not found' });
+
+    resolveInternalUserId(awardedBySource, (err2, internalAwardedById) => {
+      if (err2) return res.status(400).json({ error: 'Awarding user not found' });
+
+      db.run(
+        `INSERT INTO medal_awards (medal_id, user_id, awarded_by, date, reason)
+         VALUES (?, ?, ?, ?, ?)`,
+        [medal_id, internalUserId, internalAwardedById, date, reason],
+        function (err3) {
+          if (err3) {
+            console.error('Failed to award medal:', err3);
+            return res.status(500).json({ error: 'Failed to award medal' });
+          }
+          res.json({ success: true });
+        }
+      );
+    });
+  });
 });
 
 // Adjust points / valor
+// Path param can be INTERNAL ID or Roblox ID
 app.post('/api/users/:userId/adjust', (req, res) => {
   const { userId } = req.params;
   const { pointsDelta = 0, valorDelta = 0 } = req.body;
 
-  db.run(
-    `UPDATE users SET points = points + ?, valor = valor + ? WHERE id = ?`,
-    [pointsDelta, valorDelta, userId],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Failed to adjust values' });
-      res.json({ success: true });
-    }
-  );
+  resolveInternalUserId(userId, (err, internalId) => {
+    if (err) return res.status(400).json({ error: 'User not found' });
+
+    db.run(
+      `UPDATE users SET points = points + ?, valor = valor + ? WHERE id = ?`,
+      [pointsDelta, valorDelta, internalId],
+      function (err2) {
+        if (err2) return res.status(500).json({ error: 'Failed to adjust values' });
+        res.json({ success: true });
+      }
+    );
+  });
 });
 
 // Promote user
+// Path param can be INTERNAL ID or Roblox ID
 app.post('/api/users/:userId/promote', (req, res) => {
   const { userId } = req.params;
   const { newRank } = req.body;
 
-  db.run(
-    `UPDATE users SET rank = ? WHERE id = ?`,
-    [newRank, userId],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Failed to promote user' });
-      res.json({ success: true });
-    }
-  );
+  if (!newRank) return res.status(400).json({ error: 'newRank is required' });
+
+  resolveInternalUserId(userId, (err, internalId) => {
+    if (err) return res.status(400).json({ error: 'User not found' });
+
+    db.run(
+      `UPDATE users SET rank = ? WHERE id = ?`,
+      [newRank, internalId],
+      function (err2) {
+        if (err2) return res.status(500).json({ error: 'Failed to promote user' });
+        res.json({ success: true });
+      }
+    );
+  });
 });
 
 // ===============================
