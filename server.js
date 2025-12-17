@@ -17,6 +17,7 @@ const dbPath = path.join(__dirname, 'usafe.db');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
+  // Core tables
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,8 +26,7 @@ db.serialize(() => {
       display_name TEXT,
       branch TEXT,
       rank TEXT,
-      points INTEGER DEFAULT 0,
-      valor INTEGER DEFAULT 0,
+      combat_points INTEGER DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -80,10 +80,34 @@ db.serialize(() => {
       expires_at TEXT
     )
   `);
+
+  // --- Lightweight migration: ensure combat_points column exists ---
+  db.all(`PRAGMA table_info(users)`, (err, rows) => {
+    if (err) {
+      console.error('Failed to inspect users table:', err);
+      return;
+    }
+
+    const hasCombatPoints = rows.some(col => col.name === 'combat_points');
+
+    if (!hasCombatPoints) {
+      console.log('Adding combat_points column to users table...');
+      db.run(
+        `ALTER TABLE users ADD COLUMN combat_points INTEGER DEFAULT 0`,
+        (alterErr) => {
+          if (alterErr) {
+            console.error('Failed to add combat_points column:', alterErr);
+          } else {
+            console.log('combat_points column added.');
+          }
+        }
+      );
+    }
+  });
 });
 
 // ===============================
-// BASIC ROUTES
+// BASIC ROUTE
 // ===============================
 app.get('/', (req, res) => {
   res.json({ message: 'USAFE backend running' });
@@ -119,6 +143,10 @@ app.get('/api/avatar/:robloxId', async (req, res) => {
 // Accepts either internal ID or roblox_id
 // ===============================
 function resolveInternalUserId(idOrRoblox, callback) {
+  if (!idOrRoblox && idOrRoblox !== 0) {
+    return callback(new Error('No identifier provided'));
+  }
+
   db.get(
     `SELECT id FROM users WHERE id = ? OR roblox_id = ?`,
     [idOrRoblox, idOrRoblox.toString()],
@@ -133,6 +161,7 @@ function resolveInternalUserId(idOrRoblox, callback) {
 // ===============================
 // USER PROFILE
 // ===============================
+// Used by profile page: returns rank, combat_points, medals, trainings
 app.get('/api/users/:robloxId', (req, res) => {
   const { robloxId } = req.params;
 
@@ -172,8 +201,7 @@ app.get('/api/users/:robloxId', (req, res) => {
       display_name: row.display_name,
       branch: row.branch,
       rank: row.rank,
-      points: row.points,
-      valor: row.valor,
+      combat_points: row.combat_points || 0,
       medals: row.medals ? JSON.parse(row.medals) : [],
       trainings: row.trainings ? JSON.parse(row.trainings) : []
     });
@@ -198,7 +226,7 @@ app.post('/api/trainings', (req, res) => {
   );
 });
 
-// Create training (alias for frontend compatibility)
+// Create training (alias to match frontend /api/trainings/create)
 app.post('/api/trainings/create', (req, res) => {
   const { type, date, host_id } = req.body;
 
@@ -212,7 +240,7 @@ app.post('/api/trainings/create', (req, res) => {
   );
 });
 
-// Add attendees (expects INTERNAL IDs or Roblox IDs; will resolve)
+// Add attendees (attendees can be internal IDs or Roblox IDs)
 app.post('/api/trainings/:trainingId/attendees', (req, res) => {
   const { trainingId } = req.params;
   const { attendees } = req.body;
@@ -259,10 +287,18 @@ app.post('/api/trainings/:trainingId/attendees', (req, res) => {
 // Award medal
 // Accepts:
 //  - user_id / awarded_by as INTERNAL IDs
-//  OR
+//     OR
 //  - user_roblox_id / awarded_by_roblox_id as Roblox IDs
 app.post('/api/medals/award', (req, res) => {
-  const { medal_id, user_id, awarded_by, user_roblox_id, awarded_by_roblox_id, reason } = req.body;
+  const {
+    medal_id,
+    user_id,
+    awarded_by,
+    user_roblox_id,
+    awarded_by_roblox_id,
+    reason
+  } = req.body;
+
   const date = new Date().toISOString();
 
   if (!medal_id || !reason) {
@@ -298,20 +334,30 @@ app.post('/api/medals/award', (req, res) => {
   });
 });
 
-// Adjust points / valor
+// Adjust combat points
 // Path param can be INTERNAL ID or Roblox ID
+// Body expects: { combatDelta: number }
+// Also accepts legacy { pointsDelta } for safety.
 app.post('/api/users/:userId/adjust', (req, res) => {
   const { userId } = req.params;
-  const { pointsDelta = 0, valorDelta = 0 } = req.body;
+  const { combatDelta, pointsDelta } = req.body;
+
+  const delta = Number(
+    combatDelta !== undefined ? combatDelta : (pointsDelta !== undefined ? pointsDelta : 0)
+  );
+
+  if (Number.isNaN(delta)) {
+    return res.status(400).json({ error: 'combatDelta must be a number' });
+  }
 
   resolveInternalUserId(userId, (err, internalId) => {
     if (err) return res.status(400).json({ error: 'User not found' });
 
     db.run(
-      `UPDATE users SET points = points + ?, valor = valor + ? WHERE id = ?`,
-      [pointsDelta, valorDelta, internalId],
+      `UPDATE users SET combat_points = combat_points + ? WHERE id = ?`,
+      [delta, internalId],
       function (err2) {
-        if (err2) return res.status(500).json({ error: 'Failed to adjust values' });
+        if (err2) return res.status(500).json({ error: 'Failed to adjust combat points' });
         res.json({ success: true });
       }
     );
