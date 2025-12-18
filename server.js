@@ -26,7 +26,15 @@ const PORT = process.env.PORT || 4000;
 // =============================
 // MIDDLEWARE
 // =============================
-app.use(cors());
+app.use(cors({
+  origin: [
+    "https://usaffe-frontend.pages.dev",
+    "https://2904a8a8.usaffe-frontend.pages.dev",
+    "http://localhost:3000"
+  ],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 app.use(express.json());
 
 // =============================
