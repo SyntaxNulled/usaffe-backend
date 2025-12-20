@@ -491,6 +491,165 @@ app.get('/api/admin/keys', requireAdmin, (req, res) => {
 });
 
 // =============================
+// ROBLOX VERIFICATION SYSTEM
+// =============================
+
+// Create verification_codes table
+db.run(`
+  CREATE TABLE IF NOT EXISTS verification_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    roblox_id INTEGER,
+    code TEXT,
+    created_at TEXT
+  )
+`);
+
+// Helper: generate a new verification code
+function generateVerificationCode() {
+  return "USAFE-" + Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+// Helper: check if code is expired (10 minutes)
+function isExpired(timestamp) {
+  const created = new Date(timestamp);
+  const now = new Date();
+  const diffMs = now - created;
+  const diffMinutes = diffMs / 1000 / 60;
+  return diffMinutes > 10;
+}
+
+// ---------------------------------------------
+// POST /api/roblox/lookup
+// Looks up a Roblox user by username
+// ---------------------------------------------
+app.post('/api/roblox/lookup', async (req, res) => {
+  const { username } = req.body;
+
+  if (!username) {
+    return res.status(400).json({ error: "Username is required" });
+  }
+
+  try {
+    const response = await axios.post(
+      "https://users.roblox.com/v1/usernames/users",
+      {
+        usernames: [username],
+        excludeBannedUsers: false
+      }
+    );
+
+    const user = response.data?.data?.[0];
+
+    if (!user) {
+      return res.status(404).json({ error: "Roblox user not found" });
+    }
+
+    res.json({
+      roblox_id: user.id,
+      username: user.name,
+      display_name: user.displayName
+    });
+
+  } catch (err) {
+    console.error("Roblox lookup failed:", err.message);
+    res.status(500).json({ error: "Roblox lookup failed" });
+  }
+});
+
+// ---------------------------------------------
+// POST /api/roblox/start-verification
+// Generates and stores a verification code
+// ---------------------------------------------
+app.post('/api/roblox/start-verification', (req, res) => {
+  const { roblox_id } = req.body;
+
+  if (!roblox_id) {
+    return res.status(400).json({ error: "roblox_id is required" });
+  }
+
+  const code = generateVerificationCode();
+  const createdAt = new Date().toISOString();
+
+  db.run(
+    `
+      INSERT INTO verification_codes (roblox_id, code, created_at)
+      VALUES (?, ?, ?)
+    `,
+    [roblox_id, code, createdAt],
+    (err) => {
+      if (err) {
+        console.error("Failed to store verification code:", err);
+        return res.status(500).json({ error: "Failed to start verification" });
+      }
+
+      res.json({ code });
+    }
+  );
+});
+
+// ---------------------------------------------
+// POST /api/roblox/check
+// Confirms the code exists in the user's bio
+// ---------------------------------------------
+app.post('/api/roblox/check', async (req, res) => {
+  const { roblox_id } = req.body;
+
+  if (!roblox_id) {
+    return res.status(400).json({ error: "roblox_id is required" });
+  }
+
+  db.get(
+    `
+      SELECT * FROM verification_codes
+      WHERE roblox_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [roblox_id],
+    async (err, row) => {
+      if (err) {
+        console.error("Verification lookup failed:", err);
+        return res.status(500).json({ error: "Database error" });
+      }
+
+      if (!row) {
+        return res.status(400).json({ error: "No verification started" });
+      }
+
+      if (isExpired(row.created_at)) {
+        return res.status(400).json({ error: "Verification code expired" });
+      }
+
+      try {
+        const response = await axios.get(
+          `https://users.roblox.com/v1/users/${roblox_id}`
+        );
+
+        const bio = response.data?.description || "";
+
+        if (!bio.includes(row.code)) {
+          return res.status(400).json({ error: "Verification code not found in bio" });
+        }
+
+        // Create login token
+        const token = crypto.randomUUID();
+
+        res.json({
+          token,
+          roblox_id,
+          username: response.data.name,
+          display_name: response.data.displayName
+        });
+
+      } catch (err) {
+        console.error("Verification check failed:", err.message);
+        res.status(500).json({ error: "Verification check failed" });
+      }
+    }
+  );
+});
+
+// =============================
 // START SERVER
 // =============================
 app.get('/', (req, res) => {
